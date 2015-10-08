@@ -6,6 +6,7 @@ namespace EQueue.Broker
     {
         public string ConnectionString { get; set; }
         public string MessageTable { get; set; }
+        public string MessageLogFile { get; set; }
         public int PersistMessageInterval { get; set; }
         public int PersistMessageMaxCount { get; set; }
         public int RemoveExceedMaxCacheMessageFromMemoryInterval { get; set; }
@@ -18,7 +19,6 @@ namespace EQueue.Broker
         public int BatchLoadMessageSize { get; set; }
         public int BatchLoadQueueIndexSize { get; set; }
         public long MessageMaxCacheSize { get; set; }
-        public string MessageLogFilePath { get; set; }
 
         public SqlServerMessageStoreSetting()
         {
@@ -35,7 +35,7 @@ namespace EQueue.Broker
             BatchLoadMessageSize = 5000;
             BatchLoadQueueIndexSize = 5000;
             MessageMaxCacheSize = 100 * 10000;
-            MessageLogFilePath = "/home/admin/logs/equeue";
+            MessageLogFile = "/home/admin/logs/equeue/message.log";
         }
     }
 }

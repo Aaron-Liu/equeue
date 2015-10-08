@@ -5,7 +5,6 @@ using System.Data.SqlClient;
 using System.Linq;
 using System.Threading;
 using ECommon.Components;
-using ECommon.Extensions;
 using ECommon.Logging;
 using ECommon.Scheduling;
 using EQueue.Protocols;
@@ -27,7 +26,6 @@ namespace EQueue.Broker
         private long _lastUpdateVersion;
         private long _lastPersistVersion;
         private int _isPersistingOffsets;
-        private int _persistQueueOffsetTaskId;
 
         public SqlServerOffsetManager(SqlServerOffsetManagerSetting setting)
         {
@@ -45,11 +43,11 @@ namespace EQueue.Broker
         {
             Clear();
             RecoverQueueOffset();
-            _persistQueueOffsetTaskId = _scheduleService.ScheduleTask("SqlServerOffsetManager.TryPersistQueueOffset", TryPersistQueueOffset, _setting.PersistQueueOffsetInterval, _setting.PersistQueueOffsetInterval);
+            _scheduleService.StartTask("SqlServerOffsetManager.TryPersistQueueOffset", TryPersistQueueOffset, _setting.PersistQueueOffsetInterval, _setting.PersistQueueOffsetInterval);
         }
         public void Shutdown()
         {
-            _scheduleService.ShutdownTask(_persistQueueOffsetTaskId);
+            _scheduleService.StopTask("SqlServerOffsetManager.TryPersistQueueOffset");
         }
 
         public int GetConsumerGroupCount()
@@ -188,13 +186,14 @@ namespace EQueue.Broker
                 return new ConcurrentDictionary<string, long>();
             });
             var key = string.Format("{0}-{1}", topic, queueId);
-            queueOffsetDict.AddOrUpdate(key, offset, (k, oldOffset) =>
+            queueOffsetDict.AddOrUpdate(key, offset, (currentKey, oldOffset) =>
             {
-                if (offset != oldOffset)
+                if (offset > oldOffset)
                 {
                     changed = true;
+                    return offset;
                 }
-                return offset;
+                return oldOffset;
             });
             return changed;
         }

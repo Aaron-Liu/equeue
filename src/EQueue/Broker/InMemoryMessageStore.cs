@@ -16,11 +16,9 @@ namespace EQueue.Broker
     {
         private readonly ConcurrentDictionary<long, QueueMessage> _messageDict = new ConcurrentDictionary<long, QueueMessage>();
         private readonly ConcurrentDictionary<string, long> _queueConsumedOffsetDict = new ConcurrentDictionary<string, long>();
-        private readonly InMemoryMessageStoreSetting _setting;
         private readonly IScheduleService _scheduleService;
         private readonly ILogger _logger;
         private long _currentOffset = -1;
-        private int _removeMessageFromMemoryTaskId;
 
         public long CurrentMessageOffset
         {
@@ -35,10 +33,8 @@ namespace EQueue.Broker
             get { return false; }
         }
 
-        public InMemoryMessageStore() : this(new InMemoryMessageStoreSetting()) { }
-        public InMemoryMessageStore(InMemoryMessageStoreSetting setting)
+        public InMemoryMessageStore()
         {
-            _setting = setting;
             _scheduleService = ObjectContainer.Resolve<IScheduleService>();
             _logger = ObjectContainer.Resolve<ILoggerFactory>().Create(GetType().FullName);
         }
@@ -46,11 +42,11 @@ namespace EQueue.Broker
         public void Recover(IEnumerable<QueueConsumedOffset> queueConsumedOffsets, Action<long, string, int, long> messageRecoveredCallback) { }
         public void Start()
         {
-            _removeMessageFromMemoryTaskId = _scheduleService.ScheduleTask("InMemoryMessageStore.RemoveConsumedMessagesFromMemory", RemoveConsumedMessagesFromMemory, _setting.RemoveMessageFromMemoryInterval, _setting.RemoveMessageFromMemoryInterval);
+            _scheduleService.StartTask("InMemoryMessageStore.RemoveConsumedMessagesFromMemory", RemoveConsumedMessagesFromMemory, 1000 * 5, 1000 * 5);
         }
         public void Shutdown()
         {
-            _scheduleService.ShutdownTask(_removeMessageFromMemoryTaskId);
+            _scheduleService.StopTask("InMemoryMessageStore.RemoveConsumedMessagesFromMemory");
         }
         public long GetNextMessageOffset()
         {
@@ -62,6 +58,7 @@ namespace EQueue.Broker
                 ObjectId.GenerateNewStringId(),
                 message.Topic,
                 message.Code,
+                message.Key,
                 message.Body,
                 messageOffset,
                 queueId,
@@ -70,7 +67,7 @@ namespace EQueue.Broker
                 DateTime.Now,
                 DateTime.Now,
                 routingKey);
-            _messageDict[messageOffset] = queueMessage;
+            _messageDict.TryAdd(messageOffset, queueMessage);
             return queueMessage;
         }
         public QueueMessage GetMessage(long offset)

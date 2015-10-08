@@ -12,7 +12,6 @@ namespace EQueue.Broker.LongPolling
     public class SuspendedPullRequestManager
     {
         private const string Separator = "@";
-        private readonly object _lockObject = new object();
         private BlockingCollection<NotifyItem> _notifyQueue = new BlockingCollection<NotifyItem>(new ConcurrentQueue<NotifyItem>());
         private readonly ConcurrentDictionary<string, PullRequest> _queueRequestDict = new ConcurrentDictionary<string, PullRequest>();
         private readonly IScheduleService _scheduleService;
@@ -20,7 +19,6 @@ namespace EQueue.Broker.LongPolling
         private readonly ILogger _logger;
         private TaskFactory _taskFactory;
         private Worker _notifyMessageArrivedWorker;
-        private int _checkBlockingPullRequestTaskId;
 
         public SuspendedPullRequestManager()
         {
@@ -44,7 +42,7 @@ namespace EQueue.Broker.LongPolling
                     pullRequest.PullMessageRequest.MessageQueue.Topic,
                     pullRequest.PullMessageRequest.MessageQueue.QueueId,
                     pullRequest.PullMessageRequest.QueueOffset,
-                    pullRequest.RemotingRequestSequence);
+                    pullRequest.RemotingRequest.Sequence);
                 return pullRequest;
             }, (x, request) =>
             {
@@ -64,7 +62,7 @@ namespace EQueue.Broker.LongPolling
                     existingRequest.PullMessageRequest.MessageQueue.Topic,
                     existingRequest.PullMessageRequest.MessageQueue.QueueId,
                     existingRequest.PullMessageRequest.QueueOffset,
-                    pullRequest.RemotingRequestSequence);
+                    pullRequest.RemotingRequest.Sequence);
 
                 var currentRequest = existingRequest;
                 _taskFactory.StartNew(() => currentRequest.ReplacedAction(currentRequest));
@@ -106,24 +104,11 @@ namespace EQueue.Broker.LongPolling
 
         private void StartCheckBlockingPullRequestTask()
         {
-            lock (_lockObject)
-            {
-                if (_checkBlockingPullRequestTaskId == 0)
-                {
-                    _checkBlockingPullRequestTaskId = _scheduleService.ScheduleTask("SuspendedPullRequestManager.CheckBlockingPullRequest", CheckBlockingPullRequest, BrokerController.Instance.Setting.CheckBlockingPullRequestMilliseconds, BrokerController.Instance.Setting.CheckBlockingPullRequestMilliseconds);
-                }
-            }
+            _scheduleService.StartTask("SuspendedPullRequestManager.CheckBlockingPullRequest", CheckBlockingPullRequest, BrokerController.Instance.Setting.CheckBlockingPullRequestMilliseconds, BrokerController.Instance.Setting.CheckBlockingPullRequestMilliseconds);
         }
         private void StopCheckBlockingPullRequestTask()
         {
-            lock (_lockObject)
-            {
-                if (_checkBlockingPullRequestTaskId > 0)
-                {
-                    _scheduleService.ShutdownTask(_checkBlockingPullRequestTaskId);
-                    _checkBlockingPullRequestTaskId = 0;
-                }
-            }
+            _scheduleService.StopTask("SuspendedPullRequestManager.CheckBlockingPullRequest");
         }
         private void StartNotifyMessageArrivedWorker()
         {
@@ -157,7 +142,7 @@ namespace EQueue.Broker.LongPolling
         private void CheckNewMessageExist(string key, string topic, int queueId, long queueOffset)
         {
             var currentQueueOffset = _queueService.GetQueueCurrentOffset(topic, queueId);
-            if (currentQueueOffset >= queueOffset)
+            if (currentQueueOffset > queueOffset)
             {
                 PullRequest currentRequest;
                 if (_queueRequestDict.TryRemove(key, out currentRequest))
@@ -169,7 +154,7 @@ namespace EQueue.Broker.LongPolling
                         currentRequest.PullMessageRequest.MessageQueue.Topic,
                         currentRequest.PullMessageRequest.MessageQueue.QueueId,
                         currentRequest.PullMessageRequest.QueueOffset,
-                        currentRequest.RemotingRequestSequence,
+                        currentRequest.RemotingRequest.Sequence,
                         currentQueueOffset);
                     _taskFactory.StartNew(() => currentRequest.NewMessageArrivedAction(currentRequest));
                 }
@@ -185,7 +170,7 @@ namespace EQueue.Broker.LongPolling
                 PullRequest request;
                 if (_queueRequestDict.TryGetValue(key, out request))
                 {
-                    if (queueOffset >= request.PullMessageRequest.QueueOffset)
+                    if (queueOffset > request.PullMessageRequest.QueueOffset)
                     {
                         PullRequest currentRequest;
                         if (_queueRequestDict.TryRemove(key, out currentRequest))
@@ -197,7 +182,7 @@ namespace EQueue.Broker.LongPolling
                                 currentRequest.PullMessageRequest.MessageQueue.Topic,
                                 currentRequest.PullMessageRequest.MessageQueue.QueueId,
                                 currentRequest.PullMessageRequest.QueueOffset,
-                                currentRequest.RemotingRequestSequence,
+                                currentRequest.RemotingRequest.Sequence,
                                 queueOffset);
 
                             _taskFactory.StartNew(() => currentRequest.NewMessageArrivedAction(currentRequest));
@@ -215,7 +200,7 @@ namespace EQueue.Broker.LongPolling
                                 currentRequest.PullMessageRequest.MessageQueue.Topic,
                                 currentRequest.PullMessageRequest.MessageQueue.QueueId,
                                 currentRequest.PullMessageRequest.QueueOffset,
-                                currentRequest.RemotingRequestSequence);
+                                currentRequest.RemotingRequest.Sequence);
 
                             _taskFactory.StartNew(() => currentRequest.TimeoutAction(currentRequest));
                         }

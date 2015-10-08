@@ -4,6 +4,7 @@ using ECommon.Remoting;
 using ECommon.Serializing;
 using EQueue.Broker.Client;
 using EQueue.Protocols;
+using EQueue.Utils;
 
 namespace EQueue.Broker.Processors
 {
@@ -55,12 +56,11 @@ namespace EQueue.Broker.Processors
                 var consumerGroup = _consumerManager.GetConsumerGroup(topicConsumeInfo.ConsumerGroup);
                 topicConsumeInfo.HasConsumer = consumerGroup != null && consumerGroup.GetAllConsumerIds().Count() > 0;
                 var queueCurrentOffset = _queueService.GetQueueCurrentOffset(topicConsumeInfo.Topic, topicConsumeInfo.QueueId);
-                topicConsumeInfo.QueueMaxOffset = queueCurrentOffset;
+                topicConsumeInfo.QueueMaxOffset = queueCurrentOffset - 1;
                 topicConsumeInfo.UnConsumedMessageCount = topicConsumeInfo.QueueMaxOffset - topicConsumeInfo.ConsumedOffset;
             }
 
-            var data = _binarySerializer.Serialize(topicConsumeInfoList);
-            return new RemotingResponse((int)ResponseCode.Success, remotingRequest.Sequence, data);
+            return RemotingResponseFactory.CreateResponse(remotingRequest, _binarySerializer.Serialize(topicConsumeInfoList));
         }
     }
 }

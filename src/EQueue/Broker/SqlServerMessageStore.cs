@@ -20,7 +20,6 @@ namespace EQueue.Broker
 {
     public class SqlServerMessageStore : IMessageStore
     {
-        private const string MessageFileName = "message.log";
         private readonly byte[] EmptyBody = new byte[0];
         private readonly ConcurrentDictionary<long, QueueMessage> _messageDict = new ConcurrentDictionary<long, QueueMessage>();
         private readonly ConcurrentDictionary<string, long> _queueConsumedOffsetDict = new ConcurrentDictionary<string, long>();
@@ -35,7 +34,6 @@ namespace EQueue.Broker
         private long _persistedMessageOffset = -1;
         private int _isBatchPersistingMessages;
         private int _isRemovingConsumedMessages;
-        private readonly IList<int> _taskIds;
 
         private readonly string _deleteMessagesByTimeAndMaxQueueOffsetFormat;
         private readonly string _selectMaxMessageOffsetSQL;
@@ -74,7 +72,6 @@ namespace EQueue.Broker
             _batchLoadMessageSQLFormat = "select * from [" + _setting.MessageTable + "] where MessageOffset >= {0} and MessageOffset < {1}";
             _batchLoadQueueIndexSQLFormat = "select QueueOffset,MessageOffset from [" + _setting.MessageTable + "] where Topic = '{0}' and QueueId = {1} and QueueOffset >= {2} and QueueOffset < {3}";
             _getMessageOffsetByQueueOffset = "select MessageOffset from [" + _setting.MessageTable + "] where Topic = '{0}' and QueueId = {1} and QueueOffset = {2}";
-            _taskIds = new List<int>();
         }
 
         public void Recover(IEnumerable<QueueConsumedOffset> queueConsumedOffsets, Action<long, string, int, long> messageRecoveredCallback)
@@ -92,17 +89,17 @@ namespace EQueue.Broker
         }
         public void Start()
         {
-            _taskIds.Add(_scheduleService.ScheduleTask("SqlServerMessageStore.TryPersistMessages", TryPersistMessages, _setting.PersistMessageInterval, _setting.PersistMessageInterval));
-            _taskIds.Add(_scheduleService.ScheduleTask("SqlServerMessageStore.RemoveExceedMaxCacheMessageFromMemory", RemoveExceedMaxCacheMessageFromMemory, _setting.RemoveExceedMaxCacheMessageFromMemoryInterval, _setting.RemoveExceedMaxCacheMessageFromMemoryInterval));
-            _taskIds.Add(_scheduleService.ScheduleTask("SqlServerMessageStore.RemoveConsumedMessageFromMemory", RemoveConsumedMessageFromMemory, _setting.RemoveConsumedMessageFromMemoryInterval, _setting.RemoveConsumedMessageFromMemoryInterval));
-            _taskIds.Add(_scheduleService.ScheduleTask("SqlServerMessageStore.DeleteMessages", DeleteMessages, _setting.DeleteMessageInterval, _setting.DeleteMessageInterval));
+            _scheduleService.StartTask("SqlServerMessageStore.TryPersistMessages", TryPersistMessages, _setting.PersistMessageInterval, _setting.PersistMessageInterval);
+            _scheduleService.StartTask("SqlServerMessageStore.RemoveExceedMaxCacheMessageFromMemory", RemoveExceedMaxCacheMessageFromMemory, _setting.RemoveExceedMaxCacheMessageFromMemoryInterval, _setting.RemoveExceedMaxCacheMessageFromMemoryInterval);
+            _scheduleService.StartTask("SqlServerMessageStore.RemoveConsumedMessageFromMemory", RemoveConsumedMessageFromMemory, _setting.RemoveConsumedMessageFromMemoryInterval, _setting.RemoveConsumedMessageFromMemoryInterval);
+            _scheduleService.StartTask("SqlServerMessageStore.DeleteMessages", DeleteMessages, _setting.DeleteMessageInterval, _setting.DeleteMessageInterval);
         }
         public void Shutdown()
         {
-            foreach (var taskId in _taskIds)
-            {
-                _scheduleService.ShutdownTask(taskId);
-            }
+            _scheduleService.StopTask("SqlServerMessageStore.TryPersistMessages");
+            _scheduleService.StopTask("SqlServerMessageStore.RemoveExceedMaxCacheMessageFromMemory");
+            _scheduleService.StopTask("SqlServerMessageStore.RemoveConsumedMessageFromMemory");
+            _scheduleService.StopTask("SqlServerMessageStore.DeleteMessages");
         }
         public long GetNextMessageOffset()
         {
@@ -114,6 +111,7 @@ namespace EQueue.Broker
                 ObjectId.GenerateNewStringId(),
                 message.Topic,
                 message.Code,
+                message.Key,
                 message.Body,
                 messageOffset,
                 queueId,
@@ -122,7 +120,7 @@ namespace EQueue.Broker
                 DateTime.Now,
                 DateTime.Now,
                 routingKey);
-            _messageDict[messageOffset] = queueMessage;
+            _messageDict.TryAdd(messageOffset, queueMessage);
             WriteMessageLog(queueMessage);
             return queueMessage;
         }
@@ -334,12 +332,12 @@ namespace EQueue.Broker
                 }
                 if (totalRemovedCount > 0)
                 {
-                    _logger.InfoFormat("Auto removed {0} unconsumed messages which exceed the max cache size, current total unconsumed message count:{1}, current exceed count:{2}, currentMessageOffset:{3}, currentPersistedMessageOffset:{4}", totalRemovedCount, currentTotalCount, exceedCount, currentMessageOffset, currentPersistedMessageOffet);
+                    _logger.InfoFormat("Auto removed {0} unconsumed messages which exceed the max cache size ({1}), current total unconsumed message count:{2}, current exceed count:{3}, currentMessageOffset:{4}, currentPersistedMessageOffset:{5}", totalRemovedCount, _setting.MessageMaxCacheSize, currentTotalCount, exceedCount, currentMessageOffset, currentPersistedMessageOffet);
                 }
                 else
                 {
-                    _logger.ErrorFormat("The current unconsumed message count in memory exceeds the message max cache size, but we cannot remove any messages from memory, please check if all the messages are persisted. exceed count:{0}, current total unconsumed message count:{1}, currentMessageOffset:{2}, currentPersistedMessageOffset:{3}",
-                        exceedCount, currentTotalCount, currentMessageOffset, currentPersistedMessageOffet);
+                    _logger.ErrorFormat("The current unconsumed message count in memory exceeds the message max cache size ({0}), but we cannot remove any messages from memory, please check if all the messages are persisted. exceed count:{1}, current total unconsumed message count:{2}, currentMessageOffset:{3}, currentPersistedMessageOffset:{4}",
+                        _setting.MessageMaxCacheSize, exceedCount, currentTotalCount, currentMessageOffset, currentPersistedMessageOffet);
                 }
             }
         }
@@ -462,7 +460,7 @@ namespace EQueue.Broker
         {
             _logger.Info("No messages recovered from db, try to recover the max message offset from message log file.");
 
-            var fileName = Path.Combine(_setting.MessageLogFilePath, MessageFileName);
+            var fileName = _setting.MessageLogFile;
             if (!new FileInfo(fileName).Exists)
             {
                 _logger.InfoFormat("Message log file not exist, fileName: {0}", fileName);
@@ -486,6 +484,7 @@ namespace EQueue.Broker
             {
                 MessageId = message.MessageId,
                 MessageOffset = message.MessageOffset,
+                MessageKey = message.Key,
                 Topic = message.Topic,
                 QueueId = message.QueueId,
                 QueueOffset = message.QueueOffset,
@@ -505,7 +504,7 @@ namespace EQueue.Broker
             }
             var stack = new Stack<MessageFile>();
             var messageFiles = new List<MessageFile>();
-            var fileName = Path.Combine(_setting.MessageLogFilePath, MessageFileName);
+            var fileName = _setting.MessageLogFile;
             if (!new FileInfo(fileName).Exists)
             {
                 _logger.InfoFormat("Message log file not exist, fileName: {0}", fileName);
@@ -594,6 +593,7 @@ namespace EQueue.Broker
                 messageData.MessageId,
                 messageData.Topic,
                 messageData.Code,
+                messageData.MessageKey,
                 ObjectId.ParseHexString(messageData.Body),
                 messageData.MessageOffset,
                 messageData.QueueId,
@@ -629,6 +629,7 @@ namespace EQueue.Broker
                 {
                     MessageId = message.MessageId,
                     MessageOffset = message.MessageOffset,
+                    MessageKey = message.Key,
                     Topic = message.Topic,
                     QueueId = message.QueueId,
                     QueueOffset = message.QueueOffset,
@@ -662,6 +663,7 @@ namespace EQueue.Broker
             var messageId = (string)reader["MessageId"];
             var messageOffset = (long)reader["MessageOffset"];
             var topic = (string)reader["Topic"];
+            var key = (string)reader["MessageKey"];
             var queueId = (int)reader["QueueId"];
             var queueOffset = (long)reader["QueueOffset"];
             var code = (int)reader["Code"];
@@ -674,7 +676,7 @@ namespace EQueue.Broker
             var arrivedTime = (DateTime)reader["ArrivedTime"];
             var storedTime = (DateTime)reader["StoredTime"];
             var routingKey = (string)reader["RoutingKey"];
-            return new QueueMessage(messageId, topic, code, body, messageOffset, queueId, queueOffset, createdTime, arrivedTime, storedTime, routingKey);
+            return new QueueMessage(messageId, topic, code, key, body, messageOffset, queueId, queueOffset, createdTime, arrivedTime, storedTime, routingKey);
         }
         private void TryPersistMessages()
         {
@@ -730,6 +732,7 @@ namespace EQueue.Broker
                 var row = _messageDataTable.NewRow();
                 row["MessageId"] = message.MessageId;
                 row["MessageOffset"] = message.MessageOffset;
+                row["MessageKey"] = message.Key;
                 row["Topic"] = message.Topic;
                 row["QueueId"] = message.QueueId;
                 row["QueueOffset"] = message.QueueOffset;
@@ -772,6 +775,7 @@ namespace EQueue.Broker
                     copy.DestinationTableName = _setting.MessageTable;
                     copy.ColumnMappings.Add("MessageId", "MessageId");
                     copy.ColumnMappings.Add("MessageOffset", "MessageOffset");
+                    copy.ColumnMappings.Add("MessageKey", "MessageKey");
                     copy.ColumnMappings.Add("Topic", "Topic");
                     copy.ColumnMappings.Add("QueueId", "QueueId");
                     copy.ColumnMappings.Add("QueueOffset", "QueueOffset");
@@ -786,7 +790,7 @@ namespace EQueue.Broker
                     {
                         copy.WriteToServer(messageDataTable);
                         transaction.Commit();
-                        _logger.DebugFormat("Success to bulk copy {0} messages to db, maxMessageOffset:{1}", messageDataTable.Rows.Count, maxMessageOffset);
+                        _logger.InfoFormat("Success to bulk copy {0} messages to db, maxMessageOffset:{1}", messageDataTable.Rows.Count, maxMessageOffset);
                     }
                     catch (Exception ex)
                     {
@@ -804,6 +808,7 @@ namespace EQueue.Broker
             var table = new DataTable();
             table.Columns.Add("MessageId", typeof(string));
             table.Columns.Add("MessageOffset", typeof(long));
+            table.Columns.Add("MessageKey", typeof(string));
             table.Columns.Add("Topic", typeof(string));
             table.Columns.Add("QueueId", typeof(int));
             table.Columns.Add("QueueOffset", typeof(long));
@@ -923,13 +928,14 @@ namespace EQueue.Broker
                     messageData.MessageId,
                     messageData.Topic,
                     messageData.Code,
+                    messageData.MessageKey,
                     ObjectId.ParseHexString(messageData.Body),
                     messageData.MessageOffset,
                     messageData.QueueId,
                     messageData.QueueOffset,
                     messageData.Created,
                     messageData.Arrived,
-                    messageData.Arrived,
+                    DateTime.Now,
                     messageData.RoutingKey);
             }
         }
@@ -938,6 +944,7 @@ namespace EQueue.Broker
             public string MessageId { get; set; }
             public long MessageOffset { get; set; }
             public string Topic { get; set; }
+            public string MessageKey { get; set; }
             public int QueueId { get; set; }
             public long QueueOffset { get; set; }
             public string RoutingKey { get; set; }
