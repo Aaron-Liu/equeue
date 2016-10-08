@@ -4,164 +4,172 @@ using System.Collections.Generic;
 using System.Linq;
 using ECommon.Components;
 using ECommon.Logging;
+using ECommon.Socketing;
+using EQueue.Protocols;
+using EQueue.Utils;
 
 namespace EQueue.Broker.Client
 {
     public class ConsumerGroup
     {
-        private string _groupName;
-        private ConsumerManager _consumerManager;
-        private ConcurrentDictionary<string, ClientChannel> _consumerDict = new ConcurrentDictionary<string, ClientChannel>();
-        private ConcurrentDictionary<string, IEnumerable<string>> _consumerSubscriptionTopicDict = new ConcurrentDictionary<string, IEnumerable<string>>();
-        private ConcurrentDictionary<string, IEnumerable<string>> _consumerConsumingQueueDict = new ConcurrentDictionary<string, IEnumerable<string>>();
-        private ILogger _logger;
+        class ConsumerInfo
+        {
+            public string ConsumerId;
+            public ClientHeartbeatInfo HeartbeatInfo;
+            public IList<string> SubscriptionTopics = new List<string>();
+            public IList<MessageQueueEx> ConsumingQueues = new List<MessageQueueEx>();
+        }
+        private readonly string _groupName;
+        private readonly ConcurrentDictionary<string /*connectionId*/, ConsumerInfo> _consumerInfoDict = new ConcurrentDictionary<string, ConsumerInfo>();
+        private readonly ILogger _logger;
 
         public string GroupName { get { return _groupName; } }
 
-        public ConsumerGroup(string groupName, ConsumerManager consumerManager)
+        public ConsumerGroup(string groupName)
         {
             _groupName = groupName;
-            _consumerManager = consumerManager;
             _logger = ObjectContainer.Resolve<ILoggerFactory>().Create(GetType().FullName);
         }
 
-        public void Register(ClientChannel clientChannel)
+        public void RegisterConsumer(ITcpConnection connection, string consumerId, IList<string> subscriptionTopics, IList<MessageQueueEx> consumingMessageQueues)
         {
-            var consumer = _consumerDict.AddOrUpdate(clientChannel.ClientId, key =>
-            {
-                _logger.InfoFormat("Consumer registered. consumerGroup:{0}, consumerId:{1}, remotingEndPoint:{2}", _groupName, clientChannel.ClientId, clientChannel.Channel.RemotingEndPoint);
-                return clientChannel;
-            }, (key, old) => clientChannel);
-            consumer.LastUpdateTime = DateTime.Now;
-        }
-        public void UpdateConsumerSubscriptionTopics(ClientChannel clientChannel, IEnumerable<string> subscriptionTopics)
-        {
-            var subscriptionTopicChanged = false;
-            IEnumerable<string> oldSubscriptionTopics = new List<string>();
-            IEnumerable<string> newSubscriptionTopics = new List<string>();
+            var connectionId = connection.RemotingEndPoint.ToAddress();
 
-            _consumerSubscriptionTopicDict.AddOrUpdate(clientChannel.ClientId,
-            key =>
+            _consumerInfoDict.AddOrUpdate(connectionId, key =>
             {
-                subscriptionTopicChanged = true;
-                newSubscriptionTopics = subscriptionTopics;
-                return subscriptionTopics;
+                var newConsumerInfo = new ConsumerInfo
+                {
+                    ConsumerId = consumerId,
+                    HeartbeatInfo = new ClientHeartbeatInfo(connection) { LastHeartbeatTime = DateTime.Now },
+                    SubscriptionTopics = subscriptionTopics,
+                    ConsumingQueues = consumingMessageQueues
+                };
+                _logger.InfoFormat("Consumer registered to group, groupName: {0}, consumerId: {1}, connectionId: {2}, subscriptionTopics: {3}, consumingQueues: {4}", _groupName, consumerId, key, string.Join("|", subscriptionTopics), string.Join("|", consumingMessageQueues));
+                return newConsumerInfo;
             },
-            (key, old) =>
+            (key, existingConsumerInfo) =>
             {
-                if (IsStringCollectionChanged(old.ToList(), subscriptionTopics.ToList()))
+                existingConsumerInfo.HeartbeatInfo.LastHeartbeatTime = DateTime.Now;
+
+                var oldSubscriptionList = existingConsumerInfo.SubscriptionTopics.ToList();
+                var newSubscriptionList = subscriptionTopics.ToList();
+                if (IsStringCollectionChanged(oldSubscriptionList, newSubscriptionList))
                 {
-                    subscriptionTopicChanged = true;
-                    oldSubscriptionTopics = old;
-                    newSubscriptionTopics = subscriptionTopics;
+                    existingConsumerInfo.SubscriptionTopics = newSubscriptionList;
+                    _logger.InfoFormat("Consumer subscriptionTopics changed. groupName: {0}, consumerId: {1}, connectionId: {2}, old: {3}, new: {4}", _groupName, consumerId, key, string.Join("|", oldSubscriptionList), string.Join("|", newSubscriptionList));
                 }
-                return subscriptionTopics;
+
+                var oldConsumingQueues = existingConsumerInfo.ConsumingQueues;
+                var newConsumingQueues = consumingMessageQueues;
+                if (IsMessageQueueChanged(oldConsumingQueues, newConsumingQueues))
+                {
+                    existingConsumerInfo.ConsumingQueues = newConsumingQueues;
+                    _logger.InfoFormat("Consumer consumingQueues changed. groupName: {0}, consumerId: {1}, connectionId: {2}, old: {3}, new: {4}", _groupName, consumerId, key, string.Join("|", oldConsumingQueues), string.Join("|", newConsumingQueues));
+                }
+
+                return existingConsumerInfo;
             });
-
-            if (subscriptionTopicChanged)
-            {
-                _logger.InfoFormat("Consumer subscription topics changed. groupName:{0}, consumerId:{1}, old:{2}, new:{3}", _groupName, clientChannel.ClientId, string.Join("|", oldSubscriptionTopics), string.Join("|", newSubscriptionTopics));
-            }
         }
-        public void UpdateConsumerConsumingQueues(ClientChannel clientChannel, IEnumerable<string> consumingQueues)
+        public bool IsConsumerActive(string consumerId)
         {
-            var consumingQueueChanged = false;
-            IEnumerable<string> oldConsumingQueues = new List<string>();
-            IEnumerable<string> newConsumingQueues = new List<string>();
-
-            _consumerConsumingQueueDict.AddOrUpdate(clientChannel.ClientId,
-            key =>
-            {
-                newConsumingQueues = consumingQueues;
-                if (consumingQueues.Count() > 0)
-                {
-                    consumingQueueChanged = true;
-                }
-                return consumingQueues;
-            },
-            (key, old) =>
-            {
-                if (IsStringCollectionChanged(old.ToList(), consumingQueues.ToList()))
-                {
-                    consumingQueueChanged = true;
-                    oldConsumingQueues = old;
-                    newConsumingQueues = consumingQueues;
-                }
-                return consumingQueues;
-            });
-
-            if (consumingQueueChanged)
-            {
-                _logger.InfoFormat("Consumer consuming queues changed. groupName:{0}, consumerId:{1}, old:{2}, new:{3}", _groupName, clientChannel.ClientId, string.Join("|", oldConsumingQueues), string.Join("|", newConsumingQueues));
-            }
+            return _consumerInfoDict.Values.Any(x => x.ConsumerId == consumerId);
         }
-        public bool IsConsumerActive(string consumerRemotingAddress)
+        public void RemoveConsumer(string connectionId)
         {
-            return _consumerDict.Values.Any(x => x.Channel.RemotingEndPoint.ToString() == consumerRemotingAddress);
-        }
-        public void RemoveConsumer(string consumerRemotingAddress)
-        {
-            var clientChannel = _consumerDict.Values.SingleOrDefault(x => x.Channel.RemotingEndPoint.ToString() == consumerRemotingAddress);
-            if (clientChannel != null)
+            ConsumerInfo consumerInfo;
+            if (_consumerInfoDict.TryRemove(connectionId, out consumerInfo))
             {
-                ClientChannel currentClientChannel;
-                if (_consumerDict.TryRemove(clientChannel.ClientId, out currentClientChannel))
+                try
                 {
-                    clientChannel.Close();
-
-                    IEnumerable<string> subscriptionTopics;
-                    if (!_consumerSubscriptionTopicDict.TryRemove(clientChannel.ClientId, out subscriptionTopics))
-                    {
-                        subscriptionTopics = new List<string>();
-                    }
-                    IEnumerable<string> consumingQueues;
-                    if (!_consumerConsumingQueueDict.TryRemove(clientChannel.ClientId, out consumingQueues))
-                    {
-                        consumingQueues = new List<string>();
-                    }
-                    _logger.InfoFormat("Consumer removed from group. consumerGroup:{0}, consumerInfo:{1}, subscriptionTopics:{2}, consumingQueues:{3}", _groupName, clientChannel, string.Join("|", subscriptionTopics), string.Join("|", consumingQueues));
+                    consumerInfo.HeartbeatInfo.Connection.Close();
                 }
+                catch (Exception ex)
+                {
+                    _logger.Error(string.Format("Close connection for consumer failed, consumerId: {0}, connectionId: {1}", consumerInfo.ConsumerId, connectionId), ex);
+                }
+                _logger.InfoFormat("Consumer removed from group: {0}, consumerId: {1}, connectionId: {2}, lastHeartbeat: {3}, subscriptionTopics: {4}, consumingQueues: {5}",
+                    _groupName,
+                    consumerInfo.ConsumerId,
+                    connectionId,
+                    consumerInfo.HeartbeatInfo.LastHeartbeatTime,
+                    string.Join("|", consumerInfo.SubscriptionTopics),
+                    string.Join("|", consumerInfo.ConsumingQueues));
             }
         }
         public void RemoveNotActiveConsumers()
         {
-            foreach (var entry in _consumerDict)
+            foreach (var entry in _consumerInfoDict)
             {
-                var channelRemotingAddress = entry.Key;
-                var clientChannel = entry.Value;
-                if (clientChannel.IsTimeout(BrokerController.Instance.Setting.ConsumerExpiredTimeout))
+                if (entry.Value.HeartbeatInfo.IsTimeout(BrokerController.Instance.Setting.ConsumerExpiredTimeout))
                 {
-                    RemoveConsumer(channelRemotingAddress);
+                    RemoveConsumer(entry.Key);
                 }
             }
         }
         public IEnumerable<string> GetAllConsumerIds()
         {
-            return _consumerDict.Keys;
+            return _consumerInfoDict.Values.Select(x => x.ConsumerId).ToList();
+        }
+        public int GetConsumerCount()
+        {
+            return _consumerInfoDict.Count;
+        }
+        public int GetClientCacheMessageCount(string topic, int queueId)
+        {
+            var count = 0;
+            foreach (var consumerInfo in _consumerInfoDict.Values)
+            {
+                foreach (var messageQueue in consumerInfo.ConsumingQueues)
+                {
+                    if (messageQueue.Topic == topic && messageQueue.QueueId == queueId)
+                    {
+                        count += messageQueue.ClientCachedMessageCount;
+                    }
+                }
+            }
+            return count;
         }
         public IEnumerable<string> GetConsumerIdsForTopic(string topic)
         {
-            return _consumerSubscriptionTopicDict.Where(x => x.Value.Any(y => y == topic)).Select(z => z.Key);
-        }
-        public IEnumerable<string> QueryConsumerIdsForTopic(string topic)
-        {
-            return _consumerSubscriptionTopicDict.Where(x => x.Value.Any(y => y.Contains(topic))).Select(z => z.Key);
+            return _consumerInfoDict.Where(x => x.Value.SubscriptionTopics.Any(y => y == topic)).Select(z => z.Value.ConsumerId);
         }
         public bool IsConsumerExistForQueue(string topic, int queueId)
         {
-            var key = string.Format("{0}-{1}", topic, queueId);
-            return _consumerConsumingQueueDict.Values.Any(x => x.Any(y => y == key));
+            return _consumerInfoDict.Values.Any(x => x.ConsumingQueues.Any(y => y.Topic == topic && y.QueueId == queueId));
         }
-        public IEnumerable<string> GetConsumingQueue(string consumerId)
+        public IEnumerable<MessageQueueEx> GetConsumingQueueList(string consumerId)
         {
-            IEnumerable<string> consumingQueues;
-            if (_consumerConsumingQueueDict.TryGetValue(consumerId, out consumingQueues))
+            var consumerInfo = _consumerInfoDict.Values.SingleOrDefault(x => x.ConsumerId == consumerId);
+            if (consumerInfo != null)
             {
-                return consumingQueues;
+                return consumerInfo.ConsumingQueues.ToList();
             }
-            return new List<string>();
+            return new List<MessageQueueEx>();
         }
 
+        private bool IsMessageQueueChanged(IList<MessageQueueEx> list1, IList<MessageQueueEx> list2)
+        {
+            if (list1.Count != list2.Count)
+            {
+                return true;
+            }
+            for (var i = 0; i < list1.Count; i++)
+            {
+                var item1 = list1[i];
+                var item2 = list2[i];
+
+                if (item1.Topic != item2.Topic)
+                {
+                    return true;
+                }
+                if (item1.QueueId != item2.QueueId)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
         private bool IsStringCollectionChanged(IList<string> original, IList<string> current)
         {
             if (original.Count != current.Count)
